@@ -677,5 +677,13 @@
     "options": {
       "useNewChapterEndpoint": true
     }
+  },
+  {
+    "id": "lovelyblossoms",
+    "sourceSite": "https://lovelyblossoms.com/",
+    "sourceName": "Lovelyblossoms",
+    "options": {
+      "useNewChapterEndpoint": true
+    }
   }
 ]
