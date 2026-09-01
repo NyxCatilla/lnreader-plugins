@@ -128,3 +128,19 @@ works because target-site markup and network defenses change independently of th
   `Closes #123`).
 - Before handing off an existing-plugin change, confirm that its version was incremented and report
   any live checks that were inconclusive because of network or anti-bot behavior.
+
+## Commit messages
+
+Use Conventional Commits: `type(scope): description`
+
+- type: feat (new plugin), fix (bug fix), perf, chore, docs, refactor
+- scope: language/plugin folder, e.g. `<language>`, `<language>/<plugin>`
+- Lowercase type, imperative mood ("add" not "added"/"adds")
+
+Examples:
+- feat(<generator>): add new source
+- fix(<language>/<plugin>): correct chapter list parsing
+
+If a commit or PR was authored (fully or partly) by an AI agent, note that in the commit message
+(e.g. a `Co-Authored-By:` trailer) or the PR description so reviewers know to weight their review
+accordingly.
