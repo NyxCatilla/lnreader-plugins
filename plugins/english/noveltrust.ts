@@ -447,13 +447,14 @@ export class LightNovelWPPlugin implements Plugin.PluginBase {
   }
 
   async searchNovels(
-    searchTerm: string,
-    page: number,
-  ): Promise<Plugin.NovelItem[]> {
-    const url =
-      this.site + 'page/' + page + '/?s=' + encodeURIComponent(searchTerm);
-    const html = await this.safeFecth(url, true);
-    return this.parseNovels(html);
+  searchTerm: string,
+  page: number,
+): Promise<Plugin.NovelItem[]> {
+  const url =
+    this.site + 'search/?s=' + encodeURIComponent(searchTerm);
+
+  const html = await this.safeFecth(url, true);
+  return this.parseNovels(html);
   }
 }
 
