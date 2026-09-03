@@ -342,5 +342,14 @@
     "id": "dobynovels",
     "sourceSite": "https://dobynovels.com/",
     "sourceName": "DobyNovels"
+  },
+{
+  "id": "noveltrust",
+  "sourceSite": "https://noveltrust.com/",
+  "sourceName": "Novel Trust",
+  "options": {
+    "lang": "English",
+    "reverseChapters": false
   }
+}
 ]
