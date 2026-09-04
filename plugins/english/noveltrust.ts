@@ -1,19 +1,16 @@
-import { load } from 'cheerio';
 import { fetchApi } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
 import { defaultCover } from '@libs/defaultCover';
+import { load } from 'cheerio';
 
 class NovelTrustPlugin implements Plugin.PluginBase {
   id = 'noveltrust';
   name = 'Novel Trust';
   icon = 'src/en/noveltrust/icon.png';
   site = 'https://noveltrust.com/';
-  version = '1.0.0';
+  version = '1.0.2';
 
-  /**
-   * Convert a full NovelTrust URL into the path LNReader stores.
-   */
   private normalizePath(url: string | undefined): string {
     if (!url) return '';
 
@@ -33,24 +30,29 @@ class NovelTrustPlugin implements Plugin.PluginBase {
     }
   }
 
-  /**
-   * Parse NovelTrust's novel cards.
-   *
-   * NovelTrust uses:
-   *   .ul-list1
-   *     .li
-   *       .pic img
-   *       .txt h3.tit a
-   */
   private parseNovels(html: string): Plugin.NovelItem[] {
     const $ = load(html);
     const novels: Plugin.NovelItem[] = [];
 
+    /*
+     * NovelTrust's current listing layout:
+     *
+     * .ul-list1
+     *   .li
+     *     .pic img
+     *     .txt h3.tit a
+     */
     $('.ul-list1 .li').each((_, element) => {
-      const link = $(element).find('.txt h3.tit a').first();
-      const image = $(element).find('.pic img').first();
+      const link = $(element)
+        .find('.txt h3.tit a')
+        .first();
+
+      const image = $(element)
+        .find('.pic img')
+        .first();
 
       const url = link.attr('href');
+
       const name =
         link.attr('title')?.trim() ||
         link.text().trim();
@@ -76,29 +78,30 @@ class NovelTrustPlugin implements Plugin.PluginBase {
       showLatestNovels,
     }: Plugin.PopularNovelsOptions<{}>,
   ): Promise<Plugin.NovelItem[]> {
-    let url: string;
+    let basePath: string;
 
     if (showLatestNovels) {
-      url =
-        this.site +
-        'list/latest-release-novels/' +
-        (pageNo > 1 ? `?page=${pageNo}` : '');
+      basePath = 'list/latest-release-novels';
     } else {
-      url =
-        this.site +
-        'list/most-popular-novels/' +
-        (pageNo > 1 ? `?page=${pageNo}` : '');
+      basePath = 'list/most-popular-novels';
     }
+
+    const url =
+      pageNo <= 1
+        ? this.site + basePath
+        : `${this.site}${basePath}/${pageNo}`;
 
     const response = await fetchApi(url);
 
     if (!response.ok) {
       throw new Error(
-        `Could not reach Novel Trust (${response.status})`,
+        `Novel Trust returned HTTP ${response.status}`,
       );
     }
 
-    return this.parseNovels(await response.text());
+    return this.parseNovels(
+      await response.text(),
+    );
   }
 
   async parseNovel(
@@ -110,55 +113,48 @@ class NovelTrustPlugin implements Plugin.PluginBase {
 
     if (!response.ok) {
       throw new Error(
-        `Could not reach Novel Trust (${response.status})`,
+        `Novel Trust returned HTTP ${response.status}`,
       );
     }
 
     const html = await response.text();
     const $ = load(html);
 
-    /*
-     * NovelTrust exposes very useful OpenGraph metadata:
-     *
-     * og:novel:novel_name
-     * og:novel:author
-     * og:novel:genre
-     * og:novel:status
-     * og:image
-     */
-    const getMeta = (property: string): string => {
-      return (
-        $(`meta[property="${property}"]`)
-          .attr('content')
-          ?.trim() || ''
-      );
-    };
+    const meta = (name: string): string =>
+      $(`meta[property="${name}"]`)
+        .attr('content')
+        ?.trim() || '';
 
     const name =
-      getMeta('og:novel:novel_name') ||
+      meta('og:novel:novel_name') ||
       $('h1').first().text().trim() ||
       'Unknown';
 
     const author =
-      getMeta('og:novel:author') || 'Unknown';
+      meta('og:novel:author') ||
+      'Unknown';
 
     const genres =
-      getMeta('og:novel:genre')
+      meta('og:novel:genre')
         .split(',')
-        .map(value => value.trim())
+        .map(x => x.trim())
         .filter(Boolean)
         .join(', ');
 
     const cover =
-      getMeta('og:image') ||
+      meta('og:image') ||
       defaultCover;
 
+    /*
+     * NovelTrust's description is exposed through
+     * og:description.
+     */
     const summary =
-      getMeta('og:description') ||
-      '';
+      meta('og:description');
 
     const statusText =
-      getMeta('og:novel:status').toLowerCase();
+      meta('og:novel:status')
+        .toLowerCase();
 
     let status = NovelStatus.Unknown;
 
@@ -179,82 +175,99 @@ class NovelTrustPlugin implements Plugin.PluginBase {
       status = NovelStatus.OnHiatus;
     }
 
-    /*
-     * NovelTrust gives us 40 chapters per page.
-     *
-     * Page 1:
-     *   /book/slug
-     *
-     * Page 2:
-     *   /book/slug/2
-     *
-     * ...
-     *
-     * The final page is discovered from the Last link.
-     */
     const chapters: Plugin.ChapterItem[] = [];
 
-    const addChaptersFromPage = (
+    /*
+     * Parse one NovelTrust chapter-list page.
+     *
+     * Current structure:
+     *
+     * <ul class="ul-list5">
+     *   <li>
+     *     <a class="con" href="...">
+     *       Chapter 1 ...
+     *     </a>
+     *   </li>
+     * </ul>
+     */
+    const parseChapterPage = (
       pageHtml: string,
     ) => {
       const page = load(pageHtml);
 
-      page('ul.ul-list5 li').each((_, element) => {
-        const link = page(element)
-          .find('a.con')
-          .first();
+      page('ul.ul-list5 > li').each(
+        (_, element) => {
+          const link = page(element)
+            .find('a.con')
+            .first();
 
-        const chapterUrl = link.attr('href');
+          const chapterUrl =
+            link.attr('href');
 
-        const chapterName =
-          link.attr('title')?.trim() ||
-          link.text().trim();
+          const chapterName =
+            link.attr('title')?.trim() ||
+            link.text().trim();
 
-        if (!chapterUrl || !chapterName) {
-          return;
-        }
+          if (!chapterUrl || !chapterName) {
+            return;
+          }
 
-        const numberMatch =
-          chapterName.match(/chapter\s+(\d+(?:\.\d+)?)/i);
+          const number =
+            chapterName.match(
+              /chapter\s+(\d+(?:\.\d+)?)/i,
+            );
 
-        chapters.push({
-          name: chapterName,
-          path: this.normalizePath(chapterUrl),
-          chapterNumber: numberMatch
-            ? parseFloat(numberMatch[1])
-            : chapters.length + 1,
-        });
-      });
+          chapters.push({
+            name: chapterName,
+            path: this.normalizePath(
+              chapterUrl,
+            ),
+            chapterNumber: number
+              ? parseFloat(number[1])
+              : chapters.length + 1,
+          });
+        },
+      );
     };
 
-    // Parse the first chapter page.
-    addChaptersFromPage(html);
+    /*
+     * Page 1 is the novel page itself.
+     */
+    parseChapterPage(html);
 
     /*
-     * Find NovelTrust's final chapter-list page.
+     * NovelTrust uses:
      *
-     * Example:
-     * /book/the-dukes-eldest-son-escaped-to-the-military/8
+     * /book/slug
+     * /book/slug/2
+     * /book/slug/3
+     * ...
+     *
+     * The Last link tells us the final page.
      */
     let lastPage = 1;
 
-    $('div.page a').each((_, element) => {
-      const href = $(element).attr('href');
+    $('div.page a').each(
+      (_, element) => {
+        const href =
+          $(element).attr('href');
 
-      if (!href) return;
+        if (!href) return;
 
-      const match = href.match(/\/(\d+)\/?$/);
+        const match =
+          href.match(/\/(\d+)\/?$/);
 
-      if (match) {
-        lastPage = Math.max(
-          lastPage,
-          parseInt(match[1], 10),
-        );
-      }
-    });
+        if (match) {
+          lastPage = Math.max(
+            lastPage,
+            parseInt(match[1], 10),
+          );
+        }
+      },
+    );
 
     /*
-     * Fetch pages 2, 3, ... until the final page.
+     * Fetch all remaining chapter pages.
      */
     for (
       let pageNo = 2;
@@ -264,43 +277,43 @@ class NovelTrustPlugin implements Plugin.PluginBase {
       const pageUrl =
         `${this.site}${novelPath}/${pageNo}`;
 
-      const pageResponse = await fetchApi(pageUrl);
+      const pageResponse =
+        await fetchApi(pageUrl);
 
       if (!pageResponse.ok) {
         throw new Error(
-          `Could not fetch chapter list page ${pageNo} (${pageResponse.status})`,
+          `Novel Trust chapter page ${pageNo} returned HTTP ${pageResponse.status}`,
         );
       }
 
-      addChaptersFromPage(
+      parseChapterPage(
         await pageResponse.text(),
       );
     }
 
     /*
-     * Remove accidental duplicates and sort numerically.
+     * Remove duplicates.
      */
-    const uniqueChapters = new Map<
+    const unique = new Map<
       string,
       Plugin.ChapterItem
     >();
 
     for (const chapter of chapters) {
-      if (!uniqueChapters.has(chapter.path)) {
-        uniqueChapters.set(
+      if (!unique.has(chapter.path)) {
+        unique.set(
           chapter.path,
           chapter,
         );
       }
     }
 
-    const finalChapters = Array.from(
-      uniqueChapters.values(),
-    ).sort(
-      (a, b) =>
-        (a.chapterNumber ?? 0) -
-        (b.chapterNumber ?? 0),
-    );
+    const finalChapters =
+      Array.from(unique.values()).sort(
+        (a, b) =>
+          (a.chapterNumber ?? 0) -
+          (b.chapterNumber ?? 0),
+      );
 
     return {
       path: novelPath,
@@ -319,76 +332,64 @@ class NovelTrustPlugin implements Plugin.PluginBase {
     chapterPath: string,
   ): Promise<string> {
     /*
-     * IMPORTANT:
-     * We deliberately fetch the NovelTrust URL directly.
+     * Deliberately request NovelTrust directly.
      *
-     * We are NOT creating a NovelLive plugin and we are
-     * NOT manually redirecting to NovelLive.
-     *
-     * If NovelTrust redirects this request, this test will
-     * tell us whether LNReader's fetch layer can handle it.
+     * We do NOT manually redirect to NovelLive.
      */
-    const url = this.site + chapterPath;
+    const url =
+      this.site + chapterPath;
 
-    const response = await fetchApi(url);
+    const response =
+      await fetchApi(url);
 
     if (!response.ok) {
       throw new Error(
-        `Could not fetch chapter (${response.status})`,
+        `Novel Trust chapter returned HTTP ${response.status}`,
       );
     }
 
-    const html = await response.text();
+    const html =
+      await response.text();
+
     const $ = load(html);
 
     /*
-     * First attempt: NovelTrust-style chapter containers.
-     *
-     * We use several fallbacks because we have not yet
-     * inspected the chapter HTML itself.
+     * First try common NovelTrust reader
+     * containers.
      */
-
     const selectors = [
       '.epcontent',
-      '.txt',
-      '.chapter-content',
       '.entry-content',
       '.reading-content',
-      '.content',
+      '.chapter-content',
+      '.txt',
     ];
 
     for (const selector of selectors) {
-      const content = $(selector).first();
+      const content =
+        $(selector).first();
 
       if (content.length) {
-        /*
-         * Remove things that shouldn't appear in the
-         * chapter text.
-         */
         content.find(
-          'script, style, .ads, .ad, .advertisement',
+          'script, style, iframe, ins, .ads, .ad',
         ).remove();
 
-        const result = content.html();
+        const result =
+          content.html()?.trim();
 
-        if (result && result.trim()) {
-          return result.trim();
+        if (result) {
+          return result;
         }
       }
     }
 
     /*
-     * Last-resort fallback:
-     * return paragraphs from the page.
+     * Fallback: collect paragraph HTML.
      */
     const paragraphs = $('p')
-      .map((_, element) => {
-        const text = $(element)
-          .html()
-          ?.trim();
-
-        return text || '';
-      })
+      .map((_, element) =>
+        $(element).html()?.trim() || '',
+      )
       .get()
       .filter(Boolean);
 
@@ -397,32 +398,46 @@ class NovelTrustPlugin implements Plugin.PluginBase {
     }
 
     throw new Error(
-      'Novel Trust: could not find chapter content.',
+      'Novel Trust: chapter content could not be found.',
     );
   }
 
   async searchNovels(
     searchTerm: string,
-    pageNo: number,
+    _pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
     /*
-     * NovelTrust's visible search form uses POST with
-     * the field "searchkey".
+     * NovelTrust's actual search form is:
      *
-     * For this first test, we use the site's search URL.
-     * If NovelTrust requires the POST request strictly,
-     * search will be the first thing we fix after testing.
+     * POST /search/
+     * searchkey=<term>
+     *
+     * This is NOT ?s=<term>.
      */
-    const url =
-      this.site +
-      'search/?s=' +
-      encodeURIComponent(searchTerm);
+    const body =
+      new URLSearchParams();
 
-    const response = await fetchApi(url);
+    body.set(
+      'searchkey',
+      searchTerm,
+    );
+
+    const response =
+      await fetchApi(
+        `${this.site}search/`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/x-www-form-urlencoded',
+          },
+          body: body.toString(),
+        },
+      );
 
     if (!response.ok) {
       throw new Error(
-        `Could not search Novel Trust (${response.status})`,
+        `Novel Trust search returned HTTP ${response.status}`,
       );
     }
 
