@@ -1,130 +1,70 @@
 import { load } from 'cheerio';
-import { Parser } from 'htmlparser2';
 import { fetchApi } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
 import { defaultCover } from '@libs/defaultCover';
-import { Filters } from '@libs/filterInputs';
-import { storage } from '@libs/storage';
 
-type LightNovelWPOptions = {
-  reverseChapters?: boolean;
-  lang?: string;
-  versionIncrements?: number;
-  seriesPath?: string;
-  customJs?: string;
-  hasLocked?: boolean;
-};
+class NovelTrustPlugin implements Plugin.PluginBase {
+  id = 'noveltrust';
+  name = 'Novel Trust';
+  icon = 'src/en/noveltrust/icon.png';
+  site = 'https://noveltrust.com/';
+  version = '1.0.0';
 
-export type LightNovelWPMetadata = {
-  id: string;
-  sourceSite: string;
-  sourceName: string;
-  options?: LightNovelWPOptions;
-  filters?: Filters;
-};
+  /**
+   * Convert a full NovelTrust URL into the path LNReader stores.
+   */
+  private normalizePath(url: string | undefined): string {
+    if (!url) return '';
 
-export class LightNovelWPPlugin implements Plugin.PluginBase {
-  id: string;
-  name: string;
-  icon: string;
-  site: string;
-  version: string;
-  options?: LightNovelWPOptions;
-  filters?: Filters;
+    if (url.startsWith(this.site)) {
+      return url.slice(this.site.length);
+    }
 
-  hideLocked = storage.get('hideLocked');
-  pluginSettings?: Filters;
+    if (url.startsWith('/')) {
+      return url.slice(1);
+    }
 
-  constructor(metadata: LightNovelWPMetadata) {
-    this.id = metadata.id;
-    this.name = metadata.sourceName;
-    this.icon = `multisrc/lightnovelwp/${metadata.id.toLowerCase()}/icon.png`;
-    this.site = metadata.sourceSite;
-    const versionIncrements = metadata.options?.versionIncrements || 0;
-    this.version = `1.1.${10 + versionIncrements}`;
-    this.options = metadata.options ?? ({} as LightNovelWPOptions);
-    this.filters = metadata.filters satisfies Filters;
-
-    if (this.options?.hasLocked) {
-      this.pluginSettings = {
-        hideLocked: {
-          value: '',
-          label: 'Hide locked chapters',
-          type: 'Switch',
-        },
-      };
+    try {
+      const parsed = new URL(url);
+      return parsed.pathname.replace(/^\/+/, '');
+    } catch {
+      return url.replace(/^\/+/, '');
     }
   }
 
-  getHostname(url: string): string {
-    url = url.split('/')[2];
-    const url_parts = url.split('.');
-    url_parts.pop(); // remove TLD
-    return url_parts.join('.');
-  }
-
-  async safeFecth(url: string, search: boolean): Promise<string> {
-    const urlParts = url.split('://');
-    const protocol = urlParts.shift();
-    const sanitizedUri = urlParts[0].replace(/\/\//g, '/');
-    const r = await fetchApi(protocol + '://' + sanitizedUri);
-    if (!r.ok && search != true)
-      throw new Error(
-        'Could not reach site (' + r.status + ') try to open in webview.',
-      );
-    const data = await r.text();
-    const title = data.match(/<title>(.*?)<\/title>/)?.[1]?.trim();
-
-    if (
-      this.getHostname(url) != this.getHostname(r.url) ||
-      (title &&
-        (title == 'Bot Verification' ||
-          title == 'You are being redirected...' ||
-          title == 'Un instant...' ||
-          title == 'Just a moment...' ||
-          title == 'Redirecting...'))
-    )
-      throw new Error(
-        'Captcha error, please open in webview (or the website has changed url)',
-      );
-
-    return data;
-  }
-
-  parseNovels(html: string): Plugin.NovelItem[] {
-    html = load(html).html(); // fix "'" beeing replaced by "&#8217;" (html entities)
+  /**
+   * Parse NovelTrust's novel cards.
+   *
+   * NovelTrust uses:
+   *   .ul-list1
+   *     .li
+   *       .pic img
+   *       .txt h3.tit a
+   */
+  private parseNovels(html: string): Plugin.NovelItem[] {
+    const $ = load(html);
     const novels: Plugin.NovelItem[] = [];
 
-    const articles = html.match(/<article([^]*?)<\/article>/g) || [];
-    articles.forEach(article => {
-      const [, novelUrl, novelName] =
-        article.match(/<a href="([^"]*)".*? title="([^"]*)"/) || [];
+    $('.ul-list1 .li').each((_, element) => {
+      const link = $(element).find('.txt h3.tit a').first();
+      const image = $(element).find('.pic img').first();
 
-      if (novelName && novelUrl) {
-        const novelCover =
-          article.match(
-            /<img [^>]*?src="([^"]*)"[^>]*?(?: data-src="([^"]*)")?[^>]*>/,
-          ) || [];
+      const url = link.attr('href');
+      const name =
+        link.attr('title')?.trim() ||
+        link.text().trim();
 
-        let novelPath;
-        if (novelUrl.includes(this.site)) {
-          novelPath = novelUrl.replace(this.site, '');
-        } else {
-          // TODO: report website new url to server
-          const novelParts = novelUrl.split('/');
-          novelParts.shift();
-          novelParts.shift();
-          novelParts.shift();
-          novelPath = novelParts.join('/');
-        }
+      if (!url || !name) return;
 
-        novels.push({
-          name: novelName,
-          cover: novelCover[2] || novelCover[1] || defaultCover,
-          path: novelPath,
-        });
-      }
+      novels.push({
+        name,
+        path: this.normalizePath(url),
+        cover:
+          image.attr('src') ||
+          image.attr('data-src') ||
+          defaultCover,
+      });
     });
 
     return novels;
@@ -133,345 +73,370 @@ export class LightNovelWPPlugin implements Plugin.PluginBase {
   async popularNovels(
     pageNo: number,
     {
-      filters,
       showLatestNovels,
-    }: Plugin.PopularNovelsOptions<typeof this.filters>,
+    }: Plugin.PopularNovelsOptions<{}>,
   ): Promise<Plugin.NovelItem[]> {
-    const seriesPath = this.options?.seriesPath ?? '/series/';
-    let url = this.site + seriesPath + '?page=' + pageNo;
-    if (!filters) filters = this.filters || {};
-    if (showLatestNovels) url += '&order=latest';
-    for (const key in filters) {
-      if (typeof filters[key].value === 'object')
-        for (const value of filters[key].value as string[])
-          url += `&${key}=${value}`;
-      else if (filters[key].value) url += `&${key}=${filters[key].value}`;
+    let url: string;
+
+    if (showLatestNovels) {
+      url =
+        this.site +
+        'list/latest-release-novels/' +
+        (pageNo > 1 ? `?page=${pageNo}` : '');
+    } else {
+      url =
+        this.site +
+        'list/most-popular-novels/' +
+        (pageNo > 1 ? `?page=${pageNo}` : '');
     }
-    const html = await this.safeFecth(url, false);
-    return this.parseNovels(html);
+
+    const response = await fetchApi(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Could not reach Novel Trust (${response.status})`,
+      );
+    }
+
+    return this.parseNovels(await response.text());
   }
 
-  async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
-    const baseURL = this.site;
-    const html = await this.safeFecth(baseURL + novelPath, false);
+  async parseNovel(
+    novelPath: string,
+  ): Promise<Plugin.SourceNovel> {
+    const url = this.site + novelPath;
 
-    const novel: Plugin.SourceNovel = {
-      path: novelPath,
-      name: '',
-      genres: '',
-      summary: '',
-      author: '',
-      artist: '',
-      status: '',
-      chapters: [] as Plugin.ChapterItem[],
+    const response = await fetchApi(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Could not reach Novel Trust (${response.status})`,
+      );
+    }
+
+    const html = await response.text();
+    const $ = load(html);
+
+    /*
+     * NovelTrust exposes very useful OpenGraph metadata:
+     *
+     * og:novel:novel_name
+     * og:novel:author
+     * og:novel:genre
+     * og:novel:status
+     * og:image
+     */
+    const getMeta = (property: string): string => {
+      return (
+        $(`meta[property="${property}"]`)
+          .attr('content')
+          ?.trim() || ''
+      );
     };
-    let isParsingGenres = false;
-    let isReadingGenre = false;
-    let isReadingSummary = 0;
-    let isParsingInfo = false;
-    let isReadingInfo = false;
-    let isReadingAuthor = false;
-    let isReadingArtist = false;
-    let isReadingStatus = false;
-    let isParsingChapterList = false;
-    let isReadingChapter = false;
-    let isReadingChapterInfo = 0;
-    let isPaidChapter = false;
-    let hasLockItemOnChapterNum = false;
+
+    const name =
+      getMeta('og:novel:novel_name') ||
+      $('h1').first().text().trim() ||
+      'Unknown';
+
+    const author =
+      getMeta('og:novel:author') || 'Unknown';
+
+    const genres =
+      getMeta('og:novel:genre')
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+        .join(', ');
+
+    const cover =
+      getMeta('og:image') ||
+      defaultCover;
+
+    const summary =
+      getMeta('og:description') ||
+      '';
+
+    const statusText =
+      getMeta('og:novel:status').toLowerCase();
+
+    let status = NovelStatus.Unknown;
+
+    if (
+      statusText === 'ongoing' ||
+      statusText === 'on-going'
+    ) {
+      status = NovelStatus.Ongoing;
+    } else if (
+      statusText === 'completed' ||
+      statusText === 'complete'
+    ) {
+      status = NovelStatus.Completed;
+    } else if (
+      statusText === 'hiatus' ||
+      statusText === 'on hiatus'
+    ) {
+      status = NovelStatus.OnHiatus;
+    }
+
+    /*
+     * NovelTrust gives us 40 chapters per page.
+     *
+     * Page 1:
+     *   /book/slug
+     *
+     * Page 2:
+     *   /book/slug/2
+     *
+     * ...
+     *
+     * The final page is discovered from the Last link.
+     */
     const chapters: Plugin.ChapterItem[] = [];
-    let tempChapter = {} as Plugin.ChapterItem;
-    const hideLocked = this.hideLocked;
 
-    const parser = new Parser({
-      onopentag(name, attribs) {
-        // name and cover
-        if (!novel.cover && attribs['class']?.includes('ts-post-image')) {
-          novel.name = attribs['title'];
-          novel.cover = attribs['data-src'] || attribs['src'] || defaultCover;
-        } // genres
-        else if (
-          attribs['class'] === 'genxed' ||
-          attribs['class'] === 'sertogenre'
-        ) {
-          isParsingGenres = true;
-        } else if (isParsingGenres && name === 'a') {
-          isReadingGenre = true;
-        } // summary
-        else if (
-          name === 'div' &&
-          (attribs['class'] === 'entry-content' ||
-            attribs['itemprop'] === 'description')
-        ) {
-          isReadingSummary++;
-        } // author and status
-        else if (attribs['class'] === 'spe' || attribs['class'] === 'serl') {
-          isParsingInfo = true;
-        } else if (isParsingInfo && name === 'span') {
-          isReadingInfo = true;
-        } else if (name === 'div' && attribs['class'] === 'sertostat') {
-          isParsingInfo = true;
-          isReadingInfo = true;
-          isReadingStatus = true;
-        }
-        // chapters
-        else if (attribs['class'] && attribs['class'].includes('eplister')) {
-          isParsingChapterList = true;
-        } else if (isParsingChapterList && name === 'li') {
-          isReadingChapter = true;
-        } else if (isReadingChapter) {
-          if (name === 'a' && tempChapter.path === undefined) {
-            tempChapter.path = attribs['href'].replace(baseURL, '').trim();
-          } else if (attribs['class'] === 'epl-num') {
-            isReadingChapterInfo = 1;
-          } else if (attribs['class'] === 'epl-title') {
-            isReadingChapterInfo = 2;
-          } else if (attribs['class'] === 'epl-date') {
-            isReadingChapterInfo = 3;
-          } else if (attribs['class'] === 'epl-price') {
-            isReadingChapterInfo = 4;
-          }
-        } else if (isReadingSummary && (name === 'div' || name === 'script')) {
-          isReadingSummary++;
-        }
-      },
-      ontext(data) {
-        // genres
-        if (isParsingGenres) {
-          if (isReadingGenre) {
-            novel.genres += data + ', ';
-          }
-        } // summary
-        else if (isReadingSummary === 1 && data.trim()) {
-          novel.summary += data;
-        } // author and status
-        else if (isParsingInfo) {
-          if (isReadingInfo) {
-            const detailName = data.toLowerCase().replace(':', '').trim();
+    const addChaptersFromPage = (
+      pageHtml: string,
+    ) => {
+      const page = load(pageHtml);
 
-            if (isReadingAuthor) {
-              novel.author += data || 'Unknown';
-            } else if (isReadingArtist) {
-              novel.artist += data || 'Unknown';
-            } else if (isReadingStatus) {
-              switch (detailName) {
-                case 'مكتملة':
-                case 'completed':
-                case 'complété':
-                case 'completo':
-                case 'completado':
-                case 'tamamlandı':
-                  novel.status = NovelStatus.Completed;
-                  break;
-                case 'مستمرة':
-                case 'ongoing':
-                case 'en cours':
-                case 'em andamento':
-                case 'en progreso':
-                case 'devam ediyor':
-                  novel.status = NovelStatus.Ongoing;
-                  break;
-                case 'متوقفة':
-                case 'hiatus':
-                case 'en pause':
-                case 'hiato':
-                case 'pausa':
-                case 'pausado':
-                case 'duraklatıldı':
-                  novel.status = NovelStatus.OnHiatus;
-                  break;
-                default:
-                  novel.status = NovelStatus.Unknown;
-                  break;
-              }
-            }
+      page('ul.ul-list5 li').each((_, element) => {
+        const link = page(element)
+          .find('a.con')
+          .first();
 
-            switch (detailName) {
-              case 'الكاتب':
-              case 'author':
-              case 'auteur':
-              case 'autor':
-              case 'yazar':
-                isReadingAuthor = true;
-                break;
-              case 'الحالة':
-              case 'status':
-              case 'statut':
-              case 'estado':
-              case 'durum':
-                isReadingStatus = true;
-                break;
-              case 'الفنان':
-              case 'artist':
-              case 'artiste':
-              case 'artista':
-              case 'çizer':
-                isReadingArtist = true;
-                break;
-            }
-          }
-        } // chapters
-        else if (isParsingChapterList) {
-          if (isReadingChapter) {
-            if (isReadingChapterInfo === 1) {
-              if (data.includes('🔒')) {
-                isPaidChapter = true;
-                hasLockItemOnChapterNum = true;
-              } else if (hasLockItemOnChapterNum) {
-                isPaidChapter = false;
-              }
-              extractChapterNumber(data, tempChapter);
-            } else if (isReadingChapterInfo === 2) {
-              tempChapter.name =
-                data
-                  .match(
-                    RegExp(
-                      `^${novel.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(.+)`,
-                    ),
-                  )?.[1]
-                  ?.trim() || data.trim();
-              if (!tempChapter.chapterNumber) {
-                extractChapterNumber(data, tempChapter);
-              }
-            } else if (isReadingChapterInfo === 3) {
-              tempChapter.releaseTime = data; //new Date(data).toISOString();
-            } else if (isReadingChapterInfo === 4) {
-              const detailName = data.toLowerCase().trim();
-              switch (detailName) {
-                case 'free':
-                case 'gratuit':
-                case 'مجاني':
-                case 'livre':
-                case '':
-                  isPaidChapter = false;
-                  break;
-                default:
-                  isPaidChapter = true;
-                  break;
-              }
-            }
-          }
+        const chapterUrl = link.attr('href');
+
+        const chapterName =
+          link.attr('title')?.trim() ||
+          link.text().trim();
+
+        if (!chapterUrl || !chapterName) {
+          return;
         }
-      },
-      onclosetag(name) {
-        // genres
-        if (isParsingGenres) {
-          if (isReadingGenre) {
-            isReadingGenre = false; // stop reading genre
-          } else {
-            isParsingGenres = false; // stop parsing genres
-            novel.genres = novel.genres?.slice(0, -2); // remove trailing comma
-          }
-        } // summary
-        else if (isReadingSummary) {
-          if (name === 'p') {
-            novel.summary += '\n\n';
-          } else if (name === 'br') {
-            novel.summary += '\n';
-          } else if (name === 'div' || name === 'script') {
-            isReadingSummary--;
-          }
-        } // author and status
-        else if (isParsingInfo) {
-          if (isReadingInfo) {
-            if (name === 'span') {
-              isReadingInfo = false;
-              if (isReadingAuthor && novel.author) {
-                isReadingAuthor = false;
-              } else if (isReadingArtist && novel.artist) {
-                isReadingArtist = false;
-              } else if (isReadingStatus && novel.status !== '') {
-                isReadingStatus = false;
-              }
-            }
-          } else if (name === 'div') {
-            isParsingInfo = false;
-            novel.author = novel.author?.trim();
-            novel.artist = novel.artist?.trim();
-          }
-        } // chapters
-        else if (isParsingChapterList) {
-          if (isReadingChapter) {
-            if (isReadingChapterInfo === 1) {
-              isReadingChapterInfo = 0;
-            } else if (isReadingChapterInfo === 2) {
-              isReadingChapterInfo = 0;
-            } else if (isReadingChapterInfo === 3) {
-              isReadingChapterInfo = 0;
-            } else if (isReadingChapterInfo === 4) {
-              isReadingChapterInfo = 0;
-            } else if (name === 'li') {
-              isReadingChapter = false;
-              if (!tempChapter.chapterNumber) tempChapter.chapterNumber = 0;
-              if (isPaidChapter) tempChapter.name = '🔒 ' + tempChapter.name;
-              if (!hideLocked || !isPaidChapter) chapters.push(tempChapter);
-              tempChapter = {} as Plugin.ChapterItem;
-            }
-          } else if (name === 'ul') {
-            isParsingChapterList = false;
-          }
-        }
-      },
+
+        const numberMatch =
+          chapterName.match(/chapter\s+(\d+(?:\.\d+)?)/i);
+
+        chapters.push({
+          name: chapterName,
+          path: this.normalizePath(chapterUrl),
+          chapterNumber: numberMatch
+            ? parseFloat(numberMatch[1])
+            : chapters.length + 1,
+        });
+      });
+    };
+
+    // Parse the first chapter page.
+    addChaptersFromPage(html);
+
+    /*
+     * Find NovelTrust's final chapter-list page.
+     *
+     * Example:
+     * /book/the-dukes-eldest-son-escaped-to-the-military/8
+     */
+    let lastPage = 1;
+
+    $('div.page a').each((_, element) => {
+      const href = $(element).attr('href');
+
+      if (!href) return;
+
+      const match = href.match(/\/(\d+)\/?$/);
+
+      if (match) {
+        lastPage = Math.max(
+          lastPage,
+          parseInt(match[1], 10),
+        );
+      }
     });
 
-    parser.write(html);
-    parser.end();
+    /*
+     * Fetch pages 2, 3, ... until the final page.
+     */
+    for (
+      let pageNo = 2;
+      pageNo <= lastPage;
+      pageNo++
+    ) {
+      const pageUrl =
+        `${this.site}${novelPath}/${pageNo}`;
 
-    if (chapters.length) {
-      if (this.options?.reverseChapters) chapters.reverse();
-      novel.chapters = chapters;
+      const pageResponse = await fetchApi(pageUrl);
+
+      if (!pageResponse.ok) {
+        throw new Error(
+          `Could not fetch chapter list page ${pageNo} (${pageResponse.status})`,
+        );
+      }
+
+      addChaptersFromPage(
+        await pageResponse.text(),
+      );
     }
 
-    novel.summary = novel.summary.trim();
+    /*
+     * Remove accidental duplicates and sort numerically.
+     */
+    const uniqueChapters = new Map<
+      string,
+      Plugin.ChapterItem
+    >();
 
-    return novel;
-  }
-
-  async parseChapter(chapterPath: string): Promise<string> {
-    let data = await this.safeFecth(this.site + chapterPath, false);
-    if (this.options?.customJs) {
-      try {
-        const $ = load(data);
-        // CustomJS HERE
-        data = $.html();
-      } catch (error) {
-        console.error('Error executing customJs:', error);
-        throw error;
+    for (const chapter of chapters) {
+      if (!uniqueChapters.has(chapter.path)) {
+        uniqueChapters.set(
+          chapter.path,
+          chapter,
+        );
       }
     }
-    return (
-      data
-        .match(/<div.*?class="epcontent ([^]*?)<div.*?class="?bottomnav/g)?.[0]
-        .match(/<p[^>]*>([^]*?)<\/p>/g)
-        ?.join('\n') || ''
+
+    const finalChapters = Array.from(
+      uniqueChapters.values(),
+    ).sort(
+      (a, b) =>
+        (a.chapterNumber ?? 0) -
+        (b.chapterNumber ?? 0),
+    );
+
+    return {
+      path: novelPath,
+      name,
+      cover,
+      author,
+      artist: '',
+      genres,
+      summary,
+      status,
+      chapters: finalChapters,
+    };
+  }
+
+  async parseChapter(
+    chapterPath: string,
+  ): Promise<string> {
+    /*
+     * IMPORTANT:
+     * We deliberately fetch the NovelTrust URL directly.
+     *
+     * We are NOT creating a NovelLive plugin and we are
+     * NOT manually redirecting to NovelLive.
+     *
+     * If NovelTrust redirects this request, this test will
+     * tell us whether LNReader's fetch layer can handle it.
+     */
+    const url = this.site + chapterPath;
+
+    const response = await fetchApi(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Could not fetch chapter (${response.status})`,
+      );
+    }
+
+    const html = await response.text();
+    const $ = load(html);
+
+    /*
+     * First attempt: NovelTrust-style chapter containers.
+     *
+     * We use several fallbacks because we have not yet
+     * inspected the chapter HTML itself.
+     */
+
+    const selectors = [
+      '.epcontent',
+      '.txt',
+      '.chapter-content',
+      '.entry-content',
+      '.reading-content',
+      '.content',
+    ];
+
+    for (const selector of selectors) {
+      const content = $(selector).first();
+
+      if (content.length) {
+        /*
+         * Remove things that shouldn't appear in the
+         * chapter text.
+         */
+        content.find(
+          'script, style, .ads, .ad, .advertisement',
+        ).remove();
+
+        const result = content.html();
+
+        if (result && result.trim()) {
+          return result.trim();
+        }
+      }
+    }
+
+    /*
+     * Last-resort fallback:
+     * return paragraphs from the page.
+     */
+    const paragraphs = $('p')
+      .map((_, element) => {
+        const text = $(element)
+          .html()
+          ?.trim();
+
+        return text || '';
+      })
+      .get()
+      .filter(Boolean);
+
+    if (paragraphs.length) {
+      return paragraphs.join('\n');
+    }
+
+    throw new Error(
+      'Novel Trust: could not find chapter content.',
     );
   }
 
   async searchNovels(
-  searchTerm: string,
-  page: number,
-): Promise<Plugin.NovelItem[]> {
-  const url =
-    this.site + 'search/?s=' + encodeURIComponent(searchTerm);
+    searchTerm: string,
+    pageNo: number,
+  ): Promise<Plugin.NovelItem[]> {
+    /*
+     * NovelTrust's visible search form uses POST with
+     * the field "searchkey".
+     *
+     * For this first test, we use the site's search URL.
+     * If NovelTrust requires the POST request strictly,
+     * search will be the first thing we fix after testing.
+     */
+    const url =
+      this.site +
+      'search/?s=' +
+      encodeURIComponent(searchTerm);
 
-  const html = await this.safeFecth(url, true);
-  return this.parseNovels(html);
+    const response = await fetchApi(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Could not search Novel Trust (${response.status})`,
+      );
+    }
+
+    return this.parseNovels(
+      await response.text(),
+    );
   }
+
+  resolveUrl = (
+    path: string,
+    _isNovel?: boolean,
+  ) => {
+    return this.site + path;
+  };
 }
 
-function extractChapterNumber(data: string, tempChapter: Plugin.ChapterItem) {
-  const tempChapterNumber = data.match(/(\d+)$/);
-  if (tempChapterNumber && tempChapterNumber[0]) {
-    tempChapter.chapterNumber = parseInt(tempChapterNumber[0]);
-  }
-    }
-const plugin = new LightNovelWPPlugin({
-  id: 'noveltrust',
-  sourceSite: 'https://noveltrust.com/',
-  sourceName: 'Novel Trust',
-  options: {
-    lang: 'English',
-    reverseChapters: false,
-  },
-});
-
-export default plugin;
+export default new NovelTrustPlugin();
