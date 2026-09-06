@@ -1,72 +1,70 @@
 import { fetchApi } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
-import { NovelStatus } from '@libs/novelStatus';
+import { load as loadCheerio } from 'cheerio';
 import { defaultCover } from '@libs/defaultCover';
-import { load } from 'cheerio';
+import { NovelStatus } from '@libs/novelStatus';
 
 class NovelTrustPlugin implements Plugin.PluginBase {
   id = 'noveltrust';
   name = 'Novel Trust';
-  icon = 'src/en/noveltrust/icon.png';
-  site = 'https://noveltrust.com/';
-  version = '1.0.2';
+  icon = 'https://noveltrust.com/favicon.ico';
+  site = 'https://noveltrust.com';
+  version = '1.0.0';
 
-  private normalizePath(url: string | undefined): string {
-    if (!url) return '';
+  filters = undefined;
 
-    if (url.startsWith(this.site)) {
-      return url.slice(this.site.length);
+  webStorageUtilized = false;
+
+  normalizePath(path?: string, withDomain = true): string | undefined {
+    if (!path) {
+      return undefined;
     }
 
-    if (url.startsWith('/')) {
-      return url.slice(1);
+    if (path.startsWith('http://') || path.startsWith('https://')) {
+      return path;
     }
 
-    try {
-      const parsed = new URL(url);
-      return parsed.pathname.replace(/^\/+/, '');
-    } catch {
-      return url.replace(/^\/+/, '');
+    if (path.startsWith('/')) {
+      return withDomain ? this.site + path : path;
     }
+
+    return withDomain ? `${this.site}/${path}` : `/${path}`;
   }
 
-  private parseNovels(html: string): Plugin.NovelItem[] {
-    const $ = load(html);
+  async getPage(url: string): Promise<string> {
+    const response = await fetchApi(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Novel Trust request failed: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    return await response.text();
+  }
+
+  parseNovelCards(body: string): Plugin.NovelItem[] {
+    const $ = loadCheerio(body);
     const novels: Plugin.NovelItem[] = [];
 
-    /*
-     * NovelTrust's current listing layout:
-     *
-     * .ul-list1
-     *   .li
-     *     .pic img
-     *     .txt h3.tit a
-     */
     $('.ul-list1 .li').each((_, element) => {
-      const link = $(element)
-        .find('.txt h3.tit a')
-        .first();
+      const item = $(element);
 
-      const image = $(element)
-        .find('.pic img')
-        .first();
+      const link = item.find('.txt h3.tit a').first();
+      const image = item.find('.pic img').first();
 
-      const url = link.attr('href');
+      const name = link.text().trim();
+      const path = this.normalizePath(link.attr('href'));
+      const cover =
+        this.normalizePath(image.attr('src')) ?? defaultCover;
 
-      const name =
-        link.attr('title')?.trim() ||
-        link.text().trim();
-
-      if (!url || !name) return;
-
-      novels.push({
-        name,
-        path: this.normalizePath(url),
-        cover:
-          image.attr('src') ||
-          image.attr('data-src') ||
-          defaultCover,
-      });
+      if (name && path) {
+        novels.push({
+          name,
+          path,
+          cover,
+        });
+      }
     });
 
     return novels;
@@ -74,143 +72,295 @@ class NovelTrustPlugin implements Plugin.PluginBase {
 
   async popularNovels(
     pageNo: number,
-    {
-      showLatestNovels,
-    }: Plugin.PopularNovelsOptions<{}>,
+    _options?: Plugin.PopularNovelsOptions<undefined>,
   ): Promise<Plugin.NovelItem[]> {
-    let basePath: string;
-
-    if (showLatestNovels) {
-      basePath = 'list/latest-release-novels';
-    } else {
-      basePath = 'list/most-popular-novels';
-    }
-
     const url =
       pageNo <= 1
-        ? this.site + basePath
-        : `${this.site}${basePath}/${pageNo}`;
+        ? `${this.site}/list/latest-release-novels/`
+        : `${this.site}/list/latest-release-novels/${pageNo}`;
 
-    const response = await fetchApi(url);
+    const body = await this.getPage(url);
+
+    return this.parseNovelCards(body);
+  }
+
+  async searchNovels(
+    searchTerm: string,
+    pageNo: number,
+  ): Promise<Plugin.NovelItem[]> {
+    // Novel Trust's search form is POST-based.
+    // It does not expose conventional ?page= pagination,
+    // so only page 1 is meaningful.
+    if (pageNo > 1) {
+      return [];
+    }
+
+    const url = `${this.site}/search/`;
+
+    const body = new URLSearchParams({
+      searchkey: searchTerm,
+    }).toString();
+
+    const response = await fetchApi(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    });
 
     if (!response.ok) {
       throw new Error(
-        `Novel Trust returned HTTP ${response.status}`,
+        `Novel Trust search failed: ${response.status} ${response.statusText}`,
       );
     }
 
-    return this.parseNovels(
-      await response.text(),
-    );
+    const html = await response.text();
+
+    return this.parseNovelCards(html);
   }
 
   async parseNovel(
     novelPath: string,
   ): Promise<Plugin.SourceNovel> {
-    const url = this.site + novelPath;
+    const url = this.normalizePath(novelPath);
 
+    if (!url) {
+      throw new Error('Invalid Novel Trust novel URL');
+    }
+
+    const firstPageHtml = await this.getPage(url);
+    const $ = loadCheerio(firstPageHtml);
+
+    const title =
+      $('meta[property="og:novel:novel_name"]').attr('content')?.trim() ||
+      $('h1').first().text().trim() ||
+      'Untitled';
+
+    const cover =
+      $('meta[property="og:image"]').attr('content') ||
+      $('img').first().attr('src') ||
+      defaultCover;
+
+    const author =
+      $('meta[property="og:novel:author"]').attr('content')?.trim() ||
+      $('a[href*="/author/"]').first().text().trim() ||
+      undefined;
+
+    const genres =
+      $('meta[property="og:novel:genre"]').attr('content')
+        ?.split(',')
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .join(', ') ||
+      undefined;
+
+    const statusText =
+      $('meta[property="og:novel:status"]').attr('content')?.trim() ||
+      '';
+
+    const summary =
+      $('meta[property="og:description"]').attr('content')?.trim() ||
+      $('.summary').first().text().trim() ||
+      undefined;
+
+    const ratingText = $('meta[property="og:novel:rating"]').attr(
+      'content',
+    );
+
+    const rating = ratingText
+      ? Number.parseFloat(ratingText)
+      : undefined;
+
+    const novel: Plugin.SourceNovel = {
+      name: title,
+      path: url,
+      cover: this.normalizePath(cover) ?? defaultCover,
+      author,
+      genres,
+      summary,
+      rating,
+      status:
+        statusText.toLowerCase() === 'completed'
+          ? NovelStatus.Completed
+          : NovelStatus.Ongoing,
+      chapters: [],
+    };
+
+    /*
+     * Novel Trust displays 40 chapters per page.
+     *
+     * The <select id="indexselect"> contains:
+     * C.1 - C.40
+     * C.41 - C.80
+     * ...
+     *
+     * The option values tell us how many chapter pages exist.
+     */
+    let maxChapterPage = 1;
+
+    $('#indexselect option').each((_, element) => {
+      const value = Number.parseInt(
+        $(element).attr('value') || '',
+        10,
+      );
+
+      if (Number.isFinite(value)) {
+        maxChapterPage = Math.max(maxChapterPage, value);
+      }
+    });
+
+    const chapters: Plugin.ChapterItem[] = [];
+
+    for (let page = 1; page <= maxChapterPage; page++) {
+      let pageHtml = firstPageHtml;
+
+      if (page > 1) {
+        const pageUrl = `${url}/${page}`;
+        pageHtml = await this.getPage(pageUrl);
+      }
+
+      const page$ = loadCheerio(pageHtml);
+
+      page$('ul.ul-list5 > li').each((_, element) => {
+        const link = page$(element).find('a.con').first();
+
+        const name = link.text().trim();
+        const path = this.normalizePath(link.attr('href'));
+
+        if (!name || !path) {
+          return;
+        }
+
+        const match = name.match(/chapter\s+(\d+(?:\.\d+)?)/i);
+
+        const chapterNumber = match
+          ? Number.parseFloat(match[1])
+          : undefined;
+
+        chapters.push({
+          name,
+          path,
+          chapterNumber,
+        });
+      });
+    }
+
+    // Remove accidental duplicates while preserving order.
+    const uniqueChapters: Plugin.ChapterItem[] = [];
+    const seen = new Set<string>();
+
+    for (const chapter of chapters) {
+      if (seen.has(chapter.path)) {
+        continue;
+      }
+
+      seen.add(chapter.path);
+      uniqueChapters.push(chapter);
+    }
+
+    novel.chapters = uniqueChapters;
+
+    return novel;
+  }
+
+  async parseChapter(chapterPath: string): Promise<string> {
+    const url = this.normalizePath(chapterPath);
+
+    if (!url) {
+      throw new Error('Invalid Novel Trust chapter URL');
+    }
+
+    /*
+     * IMPORTANT:
+     *
+     * This deliberately requests the Novel Trust URL.
+     * We are NOT adding NovelLive-specific handling here.
+     *
+     * If Novel Trust redirects the request to NovelLive,
+     * this function will tell us that the chapter delivery
+     * itself is the problem.
+     */
     const response = await fetchApi(url);
 
     if (!response.ok) {
       throw new Error(
-        `Novel Trust returned HTTP ${response.status}`,
+        `Novel Trust chapter request failed: ${response.status} ${response.statusText}`,
       );
     }
 
     const html = await response.text();
-    const $ = load(html);
-
-    const meta = (name: string): string =>
-      $(`meta[property="${name}"]`)
-        .attr('content')
-        ?.trim() || '';
-
-    const name =
-      meta('og:novel:novel_name') ||
-      $('h1').first().text().trim() ||
-      'Unknown';
-
-    const author =
-      meta('og:novel:author') ||
-      'Unknown';
-
-    const genres =
-      meta('og:novel:genre')
-        .split(',')
-        .map(x => x.trim())
-        .filter(Boolean)
-        .join(', ');
-
-    const cover =
-      meta('og:image') ||
-      defaultCover;
+    const $ = loadCheerio(html);
 
     /*
-     * NovelTrust's description is exposed through
-     * og:description.
+     * Only accept content that actually looks like a
+     * Novel Trust chapter page.
      */
-    const summary =
-      meta('og:description');
+    const canonical =
+      $('link[rel="canonical"]').attr('href') || '';
 
-    const statusText =
-      meta('og:novel:status')
-        .toLowerCase();
+    const novelName =
+      $('meta[property="og:novel:novel_name"]').attr('content') || '';
 
-    let status = NovelStatus.Unknown;
+    const isNovelTrustPage =
+      canonical.includes('noveltrust.com') ||
+      novelName.length > 0 ||
+      $('body').text().includes('NOVEL TRUST');
 
-    if (
-      statusText === 'ongoing' ||
-      statusText === 'on-going'
-    ) {
-      status = NovelStatus.Ongoing;
-    } else if (
-      statusText === 'completed' ||
-      statusText === 'complete'
-    ) {
-      status = NovelStatus.Completed;
-    } else if (
-      statusText === 'hiatus' ||
-      statusText === 'on hiatus'
-    ) {
-      status = NovelStatus.OnHiatus;
+    if (!isNovelTrustPage) {
+      throw new Error(
+        'Novel Trust redirected to another site while loading this chapter.',
+      );
     }
 
-    const chapters: Plugin.ChapterItem[] = [];
+    /*
+     * Novel Trust chapter content.
+     *
+     * Try the site's own reading container first,
+     * then a few generic containers without interpreting
+     * another site's page structure.
+     */
+    const selectors = [
+      '.txt',
+      '.chapter-content',
+      '.reading-content',
+      '.entry-content',
+      '.epcontent',
+    ];
+
+    let content = null;
+
+    for (const selector of selectors) {
+      const candidate = $(selector).first();
+
+      if (candidate.length && candidate.text().trim().length > 0) {
+        content = candidate;
+        break;
+      }
+    }
+
+    if (!content) {
+      throw new Error(
+        'Novel Trust chapter content could not be found.',
+      );
+    }
 
     /*
-     * Parse one NovelTrust chapter-list page.
-     *
-     * Current structure:
-     *
-     * <ul class="ul-list5">
-     *   <li>
-     *     <a class="con" href="...">
-     *       Chapter 1 ...
-     *     </a>
-     *   </li>
-     * </ul>
+     * Remove elements that should not be displayed as chapter text.
      */
-    const parseChapterPage = (
-      pageHtml: string,
-    ) => {
-      const page = load(pageHtml);
+    content
+      .find('script, style, noscript, iframe')
+      .remove();
 
-      page('ul.ul-list5 > li').each(
-        (_, element) => {
-          const link = page(element)
-            .find('a.con')
-            .first();
+    return content.html()?.trim() || '';
+  }
 
-          const chapterUrl =
-            link.attr('href');
+  resolveUrl = (path: string, _isNovel?: boolean): string => {
+    return this.normalizePath(path) || path;
+  };
+}
 
-          const chapterName =
-            link.attr('title')?.trim() ||
-            link.text().trim();
-
-          if (!chapterUrl || !chapterName) {
-            return;
-          }
+export default new NovelTrustPlugin();
 
           const number =
             chapterName.match(
